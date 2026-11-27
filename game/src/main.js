@@ -1,134 +1,172 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
+// main.js — boot, the frame loop, and the screen state machine
+// (title → play ⇄ paused → end). The simulation is world.js, the drawing
+// is art.js + screens.js, the noise is audio.js.
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+import {
+  initAudio, isMuted, sfxCorn, sfxDash, sfxFlap, sfxGobble, sfxGolden,
+  sfxHit, sfxJump, sfxLose, sfxSplash, sfxSpotted, sfxStage, sfxWin,
+  toggleMute,
+} from './audio.js';
+import { createInput } from './input.js';
+import { drawEnd, drawPaused, drawTitle, renderPlay } from './screens.js';
+import { parseShotParams, stageShot } from './shots.js';
+import { createWorld, scoreOf, updateWorld } from './world.js';
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+const ctx = canvas.getContext('2d');
+const statusLine = document.getElementById('status');
 
-function readBest() {
+function announce(message) {
+  if (statusLine) statusLine.textContent = message;
+}
+
+function loadBest() {
   try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
+    return Number.parseInt(localStorage.getItem('turkeyRunBest') || '0', 10) || 0;
   } catch {
     return 0;
   }
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
+function saveBest(score) {
+  try { localStorage.setItem('turkeyRunBest', String(score)); } catch { /* ignore */ }
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
+// ------------------------------------------------------ screenshot mode
+
+const shot = parseShotParams();
+if (shot) {
+  const staged = stageShot(shot.shot, shot.seed);
+  if (staged.screen === 'title') {
+    drawTitle(ctx, 0.4, staged.best);
+  } else if (staged.screen === 'end') {
+    drawEnd(ctx, staged.world, staged.best, staged.isNewBest);
+  } else {
+    renderPlay(ctx, staged.world, {
+      best: staged.best,
+      muted: false,
+      showButtons: true,
+      duckHeld: staged.world.turkey.ducking,
+      hideHint: true,
+    });
   }
-  requestAnimationFrame(paint);
+  window.__shotReady = true;
+} else {
+  runGame();
 }
+
+// ------------------------------------------------------------ the game
 
 function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
+  let screen = 'title'; // title | play | paused | end
+  let world = createWorld(1);
+  let best = loadBest();
+  let isNewBest = false;
+  let spottedFlash = 0;
+  let titleTime = 0;
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
+  const input = createInput(canvas, initAudio);
+
+  // A small read-only hook so automated checks can see the game state.
+  window.__game = { screen, distance: 0, score: 0, feathers: 3 };
+
+  function startRun() {
+    world = createWorld((Date.now() % 100000) + 1);
+    isNewBest = false;
+    spottedFlash = 0;
+    screen = 'play';
+    input.clearPressed();
+    sfxGobble();
+    announce('The run begins. Jump the fences, duck the knives, reach the Freedom Gate.');
   }
 
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
+  function finishRun() {
+    const score = scoreOf(world);
+    if (score > best) {
+      best = score;
+      isNewBest = true;
       saveBest(best);
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+    screen = 'end';
+    announce(world.finished === 'escaped'
+      ? `You escaped! Final score ${score}.`
+      : `Caught by the farmer. Final score ${score}.`);
   }
 
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
+  function playEvents() {
+    for (const event of world.events) {
+      switch (event) {
+        case 'jump': sfxJump(); break;
+        case 'flap': sfxFlap(); break;
+        case 'dash': sfxDash(); break;
+        case 'corn': sfxCorn(); break;
+        case 'golden': sfxGolden(); sfxGobble(); break;
+        case 'hit': sfxHit(); sfxGobble(); break;
+        case 'splash': sfxSplash(); break;
+        case 'stage': sfxStage(); break;
+        case 'spotted': sfxSpotted(); spottedFlash = 1.2; break;
+        case 'caught': sfxLose(); break;
+        case 'escaped': sfxWin(); break;
+        default: break;
       }
-    } else {
-      accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+    world.events.length = 0;
   }
 
-  // Leaving the tab pauses a running game rather than letting knives fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
 
-  announce('Turkey Dodge. Press Space or click to start.');
+    if (input.takePressed('mute')) toggleMute();
+
+    if (screen === 'title') {
+      titleTime += dt;
+      if (input.wasPressed('jump') || input.wasPressed('start') || input.wasPressed('restart')) {
+        startRun();
+      }
+      drawTitle(ctx, titleTime, best);
+    } else if (screen === 'play') {
+      if (input.takePressed('pause')) {
+        screen = 'paused';
+        announce('Paused.');
+      } else {
+        updateWorld(world, dt, {
+          jumpPressed: input.takePressed('jump'),
+          duckHeld: input.state.duckHeld,
+          dashPressed: input.takePressed('dash'),
+        });
+        playEvents();
+        if (spottedFlash > 0) spottedFlash -= dt;
+        if (world.finished) finishRun();
+      }
+      renderPlay(ctx, world, {
+        best,
+        muted: isMuted(),
+        showButtons: true,
+        duckHeld: input.state.duckHeld,
+        spottedFlash: Math.max(0, spottedFlash),
+      });
+    } else if (screen === 'paused') {
+      if (input.takePressed('pause') || input.takePressed('start')) screen = 'play';
+      renderPlay(ctx, world, { best, muted: isMuted(), showButtons: false, duckHeld: false });
+      drawPaused(ctx);
+    } else if (screen === 'end') {
+      world.time += dt; // keeps the restart prompt blinking
+      if (input.wasPressed('restart') || input.wasPressed('start') || input.wasPressed('jump')) {
+        startRun();
+      }
+      drawEnd(ctx, world, best, isNewBest);
+    }
+
+    window.__game.screen = screen;
+    window.__game.distance = Math.floor(world.distance);
+    window.__game.score = scoreOf(world);
+    window.__game.feathers = world.feathers;
+
+    requestAnimationFrame(frame);
+  }
+
+  announce('Turkey Run. Press space or click to start the escape.');
   requestAnimationFrame(frame);
 }
-
-if (shot) runShot(shot);
-else runGame();
