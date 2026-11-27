@@ -1,79 +1,107 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// turkey could move, keep clear of knives, chase the lowest corn when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_KNIFE } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// shots.js — deterministic scenes for the hand-in screenshots.
+//
+// Opening the game with ?shot=title|play|kitchen|end&seed=N stages one
+// frozen moment and sets window.__shotReady, so a headless browser can
+// photograph the real game code exactly as a player would see it. The
+// same seed always stages the same scene.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the knives speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the turkey and a knife. */
-const MARGIN = 10;
+import { GROUND_Y, STAGES } from './settings.js';
+import { makeRng } from './rng.js';
+import { createWorld, makeObstacle, scoreOf, stageIndexFor } from './world.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the turkey into a knife; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_KNIFE) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+export function parseShotParams() {
+  const params = new URLSearchParams(window.location.search);
+  const shot = params.get('shot');
+  if (!shot) return null;
+  const seed = Number.parseInt(params.get('seed') || '7', 10) || 7;
+  return { shot, seed };
 }
 
-/** Of the safe ways to move, the one toward the lowest corn (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let corn = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_KNIFE && (corn === null || item.y > corn.y)) corn = item;
+function cornArc(world, cx, peak) {
+  for (let i = 0; i < 5; i += 1) {
+    const t = i / 4;
+    world.corns.push({
+      x: cx - 90 + t * 180,
+      y: GROUND_Y - 60 - Math.sin(t * Math.PI) * peak,
+      golden: false,
+      taken: false,
+    });
   }
-  const target = corn === null ? FIELD.width / 2 : corn.x + corn.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+// Mid-jump over a fence in the farmyard, the farmer in sight behind.
+function stagePlay(seed) {
+  const world = createWorld(seed);
+  const rng = makeRng(seed * 31 + 5);
+  world.time = 3.2;
+  world.distance = 640;
+  world.px = 640 * 40;
+  world.stageIndex = stageIndexFor(world.distance);
+  world.corn = 14;
+  world.gap = 46;
+  world.spotted = true;
+  world.turkey.feetY = GROUND_Y - 148;
+  world.turkey.vy = -120;
+  world.turkey.jumps = 2;
+  world.turkey.flapT = 0.22;
+  world.turkey.runPhase = 2.1;
+  world.farmerRunPhase = 1.4;
+  world.obstacles.push(makeObstacle('fence', 430, rng));
+  world.obstacles.push(makeObstacle('haybale', 880, rng));
+  world.obstacles.push(makeObstacle('dog', 1100, rng));
+  cornArc(world, 465, 120);
+  world.corns.push({ x: 1010, y: GROUND_Y - 150, golden: true, taken: false });
+  return world;
+}
+
+// Ducking under a flying carving knife in the kitchen, oven ahead.
+function stageKitchen(seed) {
+  const world = createWorld(seed);
+  const rng = makeRng(seed * 17 + 3);
+  world.time = 8.4;
+  world.distance = 2350;
+  world.px = 2350 * 40;
+  world.stageIndex = stageIndexFor(world.distance);
+  world.corn = 31;
+  world.golden = 1;
+  world.feathers = 2;
+  world.gap = 34;
+  world.spotted = true;
+  world.turkey.ducking = true;
+  world.turkey.runPhase = 4.2;
+  world.farmerRunPhase = 3.3;
+  world.obstacles.push(makeObstacle('knife', 440, rng));
+  world.obstacles.push(makeObstacle('oven', 810, rng));
+  world.obstacles.push(makeObstacle('steampot', 1040, rng));
+  cornArc(world, 865, 130);
+  return world;
+}
+
+// The escape, completed: the end screen with the full tally.
+function stageEnd(seed) {
+  const world = createWorld(seed);
+  world.time = 5.0;
+  world.distance = 3000;
+  world.px = 3000 * 40;
+  world.stageIndex = STAGES.length - 1;
+  world.corn = 47;
+  world.golden = 2;
+  world.feathers = 2;
+  world.finished = 'escaped';
+  return world;
+}
+
+// Returns { screen, world, best, isNewBest } for main.js to render once.
+export function stageShot(name, seed) {
+  if (name === 'title') return { screen: 'title', world: null, best: 4210, isNewBest: false };
+  if (name === 'kitchen') {
+    const world = stageKitchen(seed);
+    return { screen: 'play', world, best: 4210, isNewBest: false };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+  if (name === 'end') {
+    const world = stageEnd(seed);
+    return { screen: 'end', world, best: scoreOf(world), isNewBest: true };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  const world = stagePlay(seed);
+  return { screen: 'play', world, best: 4210, isNewBest: false };
 }
